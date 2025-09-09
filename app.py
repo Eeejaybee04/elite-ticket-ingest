@@ -136,3 +136,4 @@ def ingest_ticket():
 @app.get("/")
 def health():
     return jsonify({"ok": True, "message": "Elite Ticket Ingest API is running."})
+Add this route to your app.py (anywhere below the other routes), commit to GitHub, and let Render redeploy:
