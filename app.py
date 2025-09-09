@@ -181,5 +181,16 @@ def test_form():
 
 # ----- health check -----
 @app.get("/")
+@app.post("/_dump_text")
+def dump_text():
+    if (request.form.get("secret") or request.headers.get("X-Secret")) != APP_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"error": "no file"}), 400
+    txt = extract_text(io.BytesIO(f.read())) or ""
+    # return first 10k chars to avoid huge responses
+    return jsonify({"text": txt[:10000]})
+
 def health():
     return jsonify({"ok": True, "message": "Elite Ticket Ingest API is running."})
