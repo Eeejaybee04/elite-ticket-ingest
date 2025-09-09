@@ -258,6 +258,9 @@ def dump_text():
     txt = extract_text(io.BytesIO(f.read())) or ""
     return jsonify({"text": txt[:10000]})
 
+@app.get("/rules")
+def view_rules():
+    return jsonify(load_rules())
 
 def health():
     return jsonify({"ok": True, "message": "Elite Ticket Ingest API is running."})
