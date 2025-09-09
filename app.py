@@ -132,8 +132,30 @@ def ingest_ticket():
     ticket = parse_ticket_pdf(pdf_bytes)
     key, rule = upsert_rule(ticket)
     return jsonify({"ok": True, "rule_key": key, "parsed": ticket, "updated_rule": rule})
+@app.post("/ingest-ticket")
+def ingest_ticket():
+    if (request.form.get("secret") or request.headers.get("X-Secret")) != APP_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"error": "no file"}), 400
+    pdf_bytes = f.read()
+    ticket = parse_ticket_pdf(pdf_bytes)
+    key, rule = upsert_rule(ticket)
+    return jsonify({"ok": True, "rule_key": key, "parsed": ticket, "updated_rule": rule})
 
+# ----- test upload form (manual browser test) -----
+@app.get("/_test_upload")
+def test_form():
+    return f"""
+      <form action="/ingest-ticket" method="post" enctype="multipart/form-data">
+        <input type="hidden" name="secret" value="{APP_SECRET}">
+        <input type="file" name="file" accept="application/pdf">
+        <button type="submit">Upload PDF</button>
+      </form>
+    """
+
+# ----- health check -----
 @app.get("/")
 def health():
     return jsonify({"ok": True, "message": "Elite Ticket Ingest API is running."})
-Add this route to your app.py (anywhere below the other routes), commit to GitHub, and let Render redeploy:
