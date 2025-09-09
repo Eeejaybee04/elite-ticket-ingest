@@ -264,3 +264,90 @@ def view_rules():
 
 def health():
     return jsonify({"ok": True, "message": "Elite Ticket Ingest API is running."})
+# ---- helpers for fare patching ----
+
+def find_rule(carrier: str, origin: str, dest: str, currency: str = "PGK", pos: str = "PG"):
+    """Return (key, rule_dict) best match or (None, {}) if missing."""
+    rules = load_rules()
+    route = f"{origin.upper()}-{dest.upper()}"
+    key = f"{carrier.upper()}|{route}|{pos}|{currency.upper()}"
+    if key in rules:
+        return key, rules[key]
+
+    # fallback: sometimes people train reverse first; try the reverse route
+    rev_key = f"{carrier.upper()}|{dest.upper()}-{origin.upper()}|{pos}|{currency.upper()}"
+    if rev_key in rules:
+        return rev_key, rules[rev_key]
+
+    return None, {}
+
+def patch_fare(base_fare: float, carrier: str, origin: str, dest: str,
+               currency: str = "PGK", pos: str = "PG", markup_pct: float = 8.8):
+    """
+    Patch an Amadeus base fare using learned offsets (identical to Selling Platform),
+    then add your markup (8.8% by default).
+    """
+    key, rule = find_rule(carrier, origin, dest, currency, pos)
+
+    # learned components (default 0 if missing)
+    yqyr = float(rule.get("yqyr_offset", 0))
+    xt   = float(rule.get("xt_offset", 0))
+    gc   = float(rule.get("gc_tax", 0))
+    i9   = float(rule.get("i9_tax", 0))
+
+    sp_total = round(float(base_fare) + yqyr + xt + gc + i9, 2)  # Selling Platform identical
+    final_total = round(sp_total * (1 + markup_pct/100.0), 2)
+
+    return {
+        "rule_key": key,                 # None if not found
+        "components": {
+            "base": round(float(base_fare), 2),
+            "yqyr": yqyr,
+            "xt": xt,
+            "gc": gc,
+            "i9": i9
+        },
+        "selling_platform_total": sp_total,
+        "markup_pct": markup_pct,
+        "final_total": final_total,
+        "currency": currency.upper(),
+        "pos": pos,
+        "carrier": carrier.upper(),
+        "route": f"{origin.upper()}-{dest.upper()}"
+    }
+@app.post("/quote")
+def quote():
+    """
+    JSON body:
+    {
+      "carrier": "CG",
+      "origin": "MAG",
+      "dest": "WWK",
+      "base_fare": 238.00,
+      "currency": "PGK",   // optional, default PGK
+      "pos": "PG",         // optional, default PG
+      "markup_pct": 8.8    // optional, default 8.8
+    }
+    """
+    try:
+        data = request.get_json(force=True, silent=False)
+    except Exception:
+        return jsonify({"error": "invalid_json"}), 400
+
+    required = ("carrier", "origin", "dest", "base_fare")
+    missing = [k for k in required if k not in data]
+    if missing:
+        return jsonify({"error": f"missing_fields: {', '.join(missing)}"}), 400
+
+    res = patch_fare(
+        base_fare=data["base_fare"],
+        carrier=data["carrier"],
+        origin=data["origin"],
+        dest=data["dest"],
+        currency=data.get("currency", "PGK"),
+        pos=data.get("pos", "PG"),
+        markup_pct=float(data.get("markup_pct", 8.8))
+    )
+    return jsonify({"ok": True, **res})
+
+    
