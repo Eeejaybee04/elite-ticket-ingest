@@ -34,58 +34,71 @@ def _money(s: str) -> float:
 def parse_ticket_pdf(pdf_bytes: bytes) -> dict:
     """
     Parse a BSP or e-ticket PDF for PX / CG.
-    Extract base fare, taxes, YQ/YR, XT, GC, I9, total amount.
+    Extract base fare, taxes (YQ/YR/XT/GC/I9), and total.
     """
     text = extract_text(io.BytesIO(pdf_bytes)) or ""
-    lines = [re.sub(r'\s+', ' ', L).strip() for L in text.splitlines() if L.strip()]
+    # Normalize
+    text_up = text.upper()
+    lines = [re.sub(r'\s+', ' ', L).strip() for L in text_up.splitlines() if L.strip()]
 
-    # Carrier detection: PX or CG
+    # ---- carrier ----
     carrier = "UNK"
-    if re.search(r'\bPX\b', text): carrier = "PX"
-    if re.search(r'\bCG\b', text): carrier = "CG"
-    if "Air Niugini" in text: carrier = "PX"
-    if "PNG AIR" in text.upper(): carrier = "CG"
+    if " AIR NIUGINI" in text_up or re.search(r'\bPX\b', text_up): carrier = "PX"
+    if " PNG AIR" in text_up or re.search(r'\bCG\b', text_up):    carrier = "CG"
 
-    # Default currency PGK; detect if explicitly present
+    # ---- currency ----
     currency = "PGK"
-    mcur = re.search(r'\b(PGK)\b', text)
+    mcur = re.search(r'\b(PGK)\b', text_up)
     if mcur: currency = mcur.group(1)
 
-    # Route detection (POM-LAE, LAE-HKN, etc.)
+    # ---- route (prefer real IATA airport codes; avoid words like PNG/AIR/PGK) ----
+    BAD = {"PNG","AIR","PGK","TTL","TAX","TOTAL"}
     route = "UNK-UNK"
-    mroute = re.search(r'\b([A-Z]{3})[-\s/]([A-Z]{3})\b', text)
-    if mroute:
-        route = f"{mroute.group(1)}-{mroute.group(2)}"
 
-    # Extract tax components line by line
+    # common separators -, /, space
+    pairs = re.findall(r'\b([A-Z]{3})\s*[-/ ]\s*([A-Z]{3})\b', text_up)
+    # choose the first pair that isn't a BAD word
+    for a,b in pairs:
+        if a not in BAD and b not in BAD:
+            route = f"{a}-{b}"
+            break
+
+    # ---- components ----
+    CODES = ("YQ","YR","GC","I9","XT")
     components = {c: 0.0 for c in CODES}
+
+    # pass 1: same-line or next-line number after the code
     for i, L in enumerate(lines):
         for c in CODES:
             if re.search(rf'\b{c}\b', L):
-                # Try to get amount on the same line
                 m = re.search(r'([0-9]{1,3}(?:,[0-9]{3})*\.[0-9]{2})', L)
                 if m:
-                    components[c] = max(components[c], _money(m.group(1)))
-                # Check next line (some PDFs split values)
-                if i + 1 < len(lines):
+                    components[c] = max(components[c], float(m.group(1).replace(',', '')))
+                elif i + 1 < len(lines):
                     m2 = re.search(r'([0-9]{1,3}(?:,[0-9]{3})*\.[0-9]{2})', lines[i+1])
                     if m2:
-                        components[c] = max(components[c], _money(m2.group(1)))
+                        components[c] = max(components[c], float(m2.group(1).replace(',', '')))
 
-    # Base fare & total detection
+    # pass 2: loose formats like "GC 45.60" or "YR: 30.00"
+    for c in CODES:
+        if components[c] == 0.0:
+            m = re.search(rf'\b{c}\b[:\s]*([0-9]{{1,3}}(?:,[0-9]{{3}})*\.[0-9]{{2}})', text_up)
+            if m:
+                components[c] = float(m.group(1).replace(',', ''))
+
+    # ---- base & total ----
     base = 0.0
     total = 0.0
     for L in lines:
-        if re.search(r'\b(BASE\s*FARE|FARE)\b', L, re.I):
+        if re.search(r'\b(BASE\s*FARE|FARE)\b', L):
             m = re.search(r'([0-9]{1,3}(?:,[0-9]{3})*\.[0-9]{2})', L)
-            if m: base = max(base, _money(m.group(1)))
-        if re.search(r'\b(TOTAL|TOTAL AMOUNT|TOTAL FARE|GRAND TOTAL)\b', L, re.I):
+            if m: base = max(base, float(m.group(1).replace(',', '')))
+        if re.search(r'\b(TOTAL|TOTAL AMOUNT|TOTAL FARE|GRAND TOTAL)\b', L):
             m = re.search(r'([0-9]{1,3}(?:,[0-9]{3})*\.[0-9]{2})', L)
-            if m: total = max(total, _money(m.group(1)))
+            if m: total = max(total, float(m.group(1).replace(',', '')))
 
-    # Fallback for total: pick highest amount found anywhere
     if total == 0.0:
-        amts = [_money(m) for m in re.findall(r'([0-9]{1,3}(?:,[0-9]{3})*\.[0-9]{2})', text)]
+        amts = [float(x.replace(',','')) for x in re.findall(r'([0-9]{1,3}(?:,[0-9]{3})*\.[0-9]{2})', text_up)]
         total = max(amts) if amts else 0.0
 
     return {
