@@ -59,7 +59,7 @@ def parse_ticket_pdf(pdf_bytes: bytes) -> dict:
     REG = {"BNE","CNS","TSV","HKG","SIN","SYD","BKK","MNL","MEL","BNE"}
     IATA = PNG | REG
 
-    # -------- route detection --------
+        # -------- route detection --------
     route = "UNK-UNK"
 
     # A) FROM XXX TO YYY
@@ -73,7 +73,7 @@ def parse_ticket_pdf(pdf_bytes: bytes) -> dict:
         if m2a and m2b and m2a.group(1) in IATA and m2b.group(1) in IATA:
             route = f"{m2a.group(1)}-{m2b.group(1)}"
         else:
-            # C) Normal pairs on a line: XXX-YYY, XXX/YYY, XXX YYY
+            # C) Normal pairs on a line: XXX-YYY, XXX/YYY, or XXX YYY
             pairs = re.findall(r'\b([A-Z]{3})\s*[-/ ]\s*([A-Z]{3})\b', T)
             got = False
             for a, b in pairs:
@@ -81,12 +81,27 @@ def parse_ticket_pdf(pdf_bytes: bytes) -> dict:
                     route = f"{a}-{b}"
                     got = True
                     break
-            # D) Fallback: first two IATA tokens in order (handles 'MAG CG WWK238.00...')
+
+            # D) Fallback: parse Fare Calculation line and pick first two IATA tokens
             if not got:
-                tokens = re.findall(r'\b[A-Z]{3}\b', T)  # every 3-letter token
-                found = [tok for tok in tokens if tok in IATA and tok not in BAD]
-                if len(found) >= 2:
-                    route = f"{found[0]}-{found[1]}"
+                # use RAW text (with line breaks) to capture the line after "FARE CALCULATION"
+                raw_up = raw.upper()
+                mfc = re.search(r'FARE\s+CALCULATION.*?\n([^\n]{0,200})', raw_up)
+                fc_line = mfc.group(1) if mfc else ""
+
+                # if not found, also look for a line starting with ':' that contains END (as seen in your dump)
+                if not fc_line:
+                    mfc2 = re.search(r'^\s*:\s*([^\n]*END[^\n]*)$', raw_up, re.M)
+                    fc_line = mfc2.group(1) if mfc2 else ""
+
+                # tokenize: 3 letters not adjacent to other letters (so it matches WWK in WWK238.00)
+                tokens = re.findall(r'(?<![A-Z])[A-Z]{3}(?![A-Z])', fc_line)
+
+                # filter out garbage and take the first two real airports
+                airports = [t for t in tokens if t in IATA and t not in BAD and t not in {"END","PGK"}]
+                if len(airports) >= 2:
+                    route = f"{airports[0]}-{airports[1]}"
+
 
     # -------- taxes --------
     codes = ("YQ","YR","XT","GC","I9")
