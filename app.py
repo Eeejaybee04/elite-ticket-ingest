@@ -33,15 +33,14 @@ def _money(s: str) -> float:
 
 def parse_ticket_pdf(pdf_bytes: bytes) -> dict:
     """
-    Parse a BSP or e-ticket PDF for PX/CG and extract:
-    - carrier (PX/CG)
-    - route (e.g., POM-LAE) using real IATA airport codes
-    - currency (default PGK)
-    - components: base, YQ, YR, XT, GC, I9
-    - total
+    Robust parser for PX/CG tickets:
+    - Route: detects FROM/TO, ORIGIN/DESTINATION, or the first two valid IATA
+      codes in reading order (handles 'MAG CG WWK238.00...' with no separators).
+    - Taxes: supports CODE -> amount and amount -> CODE (e.g. 'PGK 22.80GC').
+    - Base & total: from labels; base can be inferred as total - taxes if needed.
     """
-    text = extract_text(io.BytesIO(pdf_bytes)) or ""
-    T = text.upper()
+    raw = extract_text(io.BytesIO(pdf_bytes)) or ""
+    T = raw.upper()
     lines = [re.sub(r'\s+', ' ', L).strip() for L in T.splitlines() if L.strip()]
 
     # -------- carrier --------
@@ -54,53 +53,93 @@ def parse_ticket_pdf(pdf_bytes: bytes) -> dict:
     mcur = re.search(r'\b(PGK)\b', T)
     if mcur: currency = mcur.group(1)
 
-    # -------- route (strict: only valid IATA airports) --------
-    # Common PNG IATA airport codes (add more as you encounter them)
-    PNG_CODES = {
-        "POM","LAE","HGU","RAB","GUR","WWK","HKN","MAG","KVG","LSA","TIZ","KIE",
-        "LNV","BUA","KRI","KMA","GKA","MDU","TBG","UAK","KRU","HKN","KPX","KDU",
-        "RBP","BUL","KSB","KVG","PNP"  # PNP=Girua/Popondetta
-    }
-    # Neighbours that sometimes appear on regional tickets:
-    NEAR = {"BNE","CNS","BNE","CNS","TSV","CNS","BNE","CNS","BNE","CNS","BNE","CNS",
-            "CNS","BNE","BNE","CNS","TSV","CNS","HKG","SIN","BKK","MNL","SYD","BNE","CNS","MEL","BNE","CNS"}
-    IATA = PNG_CODES | NEAR
+    # -------- IATA sets --------
+    BAD = {"FOR","THE","PNG","AIR","PGK","TTL","TAX","TOTAL","AMOUNT","RECEIPT"}
+    PNG = {"POM","LAE","HGU","RAB","GUR","WWK","HKN","MAG","KVG","PNP","KRI","GKA","KMA","LNV","BUA","KIE","MDU","GKA"}
+    REG = {"BNE","CNS","TSV","HKG","SIN","SYD","BKK","MNL","MEL","BNE"}
+    IATA = PNG | REG
 
+    # -------- route detection --------
     route = "UNK-UNK"
 
-    # pattern 1: FROM XXX TO YYY (allow a few characters in between)
-    mft = re.search(r'\bFROM\s+([A-Z]{3})\b.{0,15}\bTO\s+([A-Z]{3})\b', T)
-    if mft and mft.group(1) in IATA and mft.group(2) in IATA:
-        route = f"{mft.group(1)}-{mft.group(2)}"
+    # A) FROM XXX TO YYY
+    m = re.search(r'\bFROM\s+([A-Z]{3})\b.{0,20}\bTO\s+([A-Z]{3})\b', T)
+    if m and m.group(1) in IATA and m.group(2) in IATA:
+        route = f"{m.group(1)}-{m.group(2)}"
     else:
-        # pattern 2: XXX-YYY or XXX / YYY or XXX YYY on one line
-        pairs = re.findall(r'\b([A-Z]{3})\s*[-/ ]\s*([A-Z]{3})\b', T)
-        for a, b in pairs:
-            if a in IATA and b in IATA:
-                route = f"{a}-{b}"
-                break
+        # B) ORIGIN / DEST(INATION)
+        m2a = re.search(r'\bORIGIN\b[:\s]+([A-Z]{3})', T)
+        m2b = re.search(r'\bDEST(?:INATION)?\b[:\s]+([A-Z]{3})', T)
+        if m2a and m2b and m2a.group(1) in IATA and m2b.group(1) in IATA:
+            route = f"{m2a.group(1)}-{m2b.group(1)}"
+        else:
+            # C) Normal pairs on a line: XXX-YYY, XXX/YYY, XXX YYY
+            pairs = re.findall(r'\b([A-Z]{3})\s*[-/ ]\s*([A-Z]{3})\b', T)
+            got = False
+            for a, b in pairs:
+                if a not in BAD and b not in BAD and a in IATA and b in IATA:
+                    route = f"{a}-{b}"
+                    got = True
+                    break
+            # D) Fallback: first two IATA tokens in order (handles 'MAG CG WWK238.00...')
+            if not got:
+                tokens = re.findall(r'\b[A-Z]{3}\b', T)  # every 3-letter token
+                found = [tok for tok in tokens if tok in IATA and tok not in BAD]
+                if len(found) >= 2:
+                    route = f"{found[0]}-{found[1]}"
 
-    # -------- components --------
-    CODES = ("YQ","YR","XT","GC","I9")
-    components = {c: 0.0 for c in CODES}
+    # -------- taxes --------
+    codes = ("YQ","YR","XT","GC","I9")
+    components = {c: 0.0 for c in codes}
 
-    # pass 1: tight – code followed by amount within ~15 chars
-    for c in CODES:
-        m = re.search(rf'\b{c}\b[^\d]{{0,15}}([0-9]{{1,3}}(?:,[0-9]{{3}})*\.[0-9]{{2}})', T)
-        if m:
-            components[c] = float(m.group(1).replace(',', ''))
-
-    # pass 2: loose “CODE 45.60” or “CODE: 45.60” anywhere
-    for c in CODES:
-        if components[c] == 0.0:
-            for m in re.finditer(rf'\b{c}\b[:\s]+([0-9]{{1,3}}(?:,[0-9]{{3}})*\.[0-9]{{2}})', T):
+    # 1) compact TAX block on one line
+    tax_line = None
+    for L in lines:
+        if "TAX" in L:
+            tax_line = L
+            break
+    if tax_line:
+        for c in codes:
+            # code -> amount   (YR 20.00)
+            m = re.search(rf'\b{c}\b[:\s]+([0-9]{{1,3}}(?:,[0-9]{{3}})*\.[0-9]{{2}})', tax_line)
+            if m:
                 components[c] = max(components[c], float(m.group(1).replace(',', '')))
+            # amount -> code   (PGK 22.80GC) or (22.80 GC)
+            m2 = re.search(rf'(?:PGK\s*)?([0-9]{{1,3}}(?:,[0-9]{{3}})*\.[0-9]{{2}})\s*{c}\b', tax_line)
+            if m2:
+                components[c] = max(components[c], float(m2.group(1).replace(',', '')))
+
+    # 2) spread across lines
+    for i, L in enumerate(lines):
+        for c in codes:
+            if components[c] > 0:
+                continue
+            if re.search(rf'\b{c}\b', L):
+                m = re.search(r'([0-9]{1,3}(?:,[0-9]{3})*\.[0-9]{2})', L)
+                if m:
+                    components[c] = float(m.group(1).replace(',', ''))
+                elif i + 1 < len(lines):
+                    m2 = re.search(r'([0-9]{1,3}(?:,[0-9]{3})*\.[0-9]{2})', lines[i+1])
+                    if m2:
+                        components[c] = float(m2.group(1).replace(',', ''))
+            else:
+                # amount then code on same line   (PGK 22.80GC / 22.80 GC)
+                m3 = re.search(rf'(?:PGK\s*)?([0-9]{{1,3}}(?:,[0-9]{{3}})*\.[0-9]{{2}})\s*{c}\b', L)
+                if m3:
+                    components[c] = max(components[c], float(m3.group(1).replace(',', '')))
+
+    # Treat non-YQ/YR airline/airport taxes as XT if you want them aggregated:
+    # The dump showed UN and NX. Add them into XT so totals match Selling Platform.
+    for code_alias in ("UN","NX"):
+        m = re.search(rf'(?:PGK\s*)?([0-9]{{1,3}}(?:,[0-9]{{3}})*\.[0-9]{{2}})\s*{code_alias}\b', T)
+        if m:
+            components["XT"] = round(components["XT"] + float(m.group(1).replace(',', '')), 2)
 
     # -------- base fare --------
     base = 0.0
-    # “BASE FARE … 123.45” or “FARE: PGK 123.45”
+    # look for 'BASE FARE' or line with 'AIR FARE' / 'FARE'
     for L in lines:
-        if "BASE FARE" in L or re.search(r'\bFARE\b', L):
+        if "BASE FARE" in L or re.search(r'\b(AIR\s*FARE|FARE)\b', L):
             m = re.search(r'(?:PGK\s*)?([0-9]{1,3}(?:,[0-9]{3})*\.[0-9]{2})', L)
             if m:
                 base = max(base, float(m.group(1).replace(',', '')))
@@ -116,6 +155,11 @@ def parse_ticket_pdf(pdf_bytes: bytes) -> dict:
         amts = [float(x.replace(',', '')) for x in re.findall(r'([0-9]{1,3}(?:,[0-9]{3})*\.[0-9]{2})', T)]
         total = max(amts) if amts else 0.0
 
+    # infer base if needed
+    taxes_sum = sum(components.values())
+    if base == 0.0 and total > taxes_sum > 0:
+        base = round(total - taxes_sum, 2)
+
     return {
         "carrier": carrier,
         "route": route,
@@ -123,7 +167,6 @@ def parse_ticket_pdf(pdf_bytes: bytes) -> dict:
         "components": {"base": base, **components},
         "total": total
     }
-
 
 def upsert_rule(ticket: dict, pos: str = "PG"):
     """
