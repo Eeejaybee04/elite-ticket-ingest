@@ -8,6 +8,7 @@ APP_SECRET = os.getenv("INGEST_SECRET", "REPLACE_WITH_STRONG_RANDOM_SECRET")
 RULES_PATH = os.getenv("RULES_PATH", "rules.json")
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024  # accept PDFs up to 25 MB
 
 # Tax codes we want to track for PX and CG tickets
 CODES = ("YQ", "YR", "GC", "I9", "XT")
@@ -24,13 +25,13 @@ def save_rules(rules):
     with open(RULES_PATH, "w") as f:
         json.dump(rules, f, indent=2, sort_keys=True)
 
-def _money(s):
+def _money(s: str) -> float:
     try:
         return float(s.replace(",", ""))
     except Exception:
         return 0.0
 
-def parse_ticket_pdf(pdf_bytes):
+def parse_ticket_pdf(pdf_bytes: bytes) -> dict:
     """
     Parse a BSP or e-ticket PDF for PX / CG.
     Extract base fare, taxes, YQ/YR, XT, GC, I9, total amount.
@@ -40,8 +41,8 @@ def parse_ticket_pdf(pdf_bytes):
 
     # Carrier detection: PX or CG
     carrier = "UNK"
-    if re.search(r'\b(PX)\b', text, re.I): carrier = "PX"
-    if re.search(r'\b(CG)\b', text, re.I): carrier = "CG"
+    if re.search(r'\bPX\b', text): carrier = "PX"
+    if re.search(r'\bCG\b', text): carrier = "CG"
     if "Air Niugini" in text: carrier = "PX"
     if "PNG AIR" in text.upper(): carrier = "CG"
 
@@ -95,7 +96,7 @@ def parse_ticket_pdf(pdf_bytes):
         "total": total
     }
 
-def upsert_rule(ticket, pos="PG"):
+def upsert_rule(ticket: dict, pos: str = "PG"):
     """
     Use parsed ticket data to update/add a rule in rules.json.
     Key = carrier|route|pos|currency.
@@ -120,25 +121,19 @@ def upsert_rule(ticket, pos="PG"):
     save_rules(rules)
     return key, r
 
+# ----- ingest endpoint (ONE definition only) -----
 @app.post("/ingest-ticket")
 def ingest_ticket():
-    """Endpoint Gmail Apps Script will POST PDFs to"""
+    # auth
     if (request.form.get("secret") or request.headers.get("X-Secret")) != APP_SECRET:
         return jsonify({"error": "unauthorized"}), 401
+
+    # file presence
     f = request.files.get("file")
     if not f:
         return jsonify({"error": "no file"}), 400
-    pdf_bytes = f.read()
-    ticket = parse_ticket_pdf(pdf_bytes)
-    key, rule = upsert_rule(ticket)
-    return jsonify({"ok": True, "rule_key": key, "parsed": ticket, "updated_rule": rule})
-@app.post("/ingest-ticket")
-def ingest_ticket():
-    if (request.form.get("secret") or request.headers.get("X-Secret")) != APP_SECRET:
-        return jsonify({"error": "unauthorized"}), 401
-    f = request.files.get("file")
-    if not f:
-        return jsonify({"error": "no file"}), 400
+
+    # parse + update rules
     pdf_bytes = f.read()
     ticket = parse_ticket_pdf(pdf_bytes)
     key, rule = upsert_rule(ticket)
