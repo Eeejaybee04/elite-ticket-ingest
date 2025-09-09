@@ -178,19 +178,28 @@ def test_form():
         <button type="submit">Upload PDF</button>
       </form>
     """
-
-# ----- health check -----
-@app.get("/")
-@app.post("/_dump_text")
+# --- dump raw text seen by pdfminer (for debugging) ---
+@app.route("/_dump_text", methods=["GET", "POST"])
 def dump_text():
+    # Show an upload form on GET
+    if request.method == "GET":
+        return f"""
+          <form action="/_dump_text" method="post" enctype="multipart/form-data">
+            <input type="hidden" name="secret" value="{APP_SECRET}">
+            <input type="file" name="file" accept="application/pdf">
+            <button type="submit">Dump PDF Text</button>
+          </form>
+        """
+
+    # Handle POST: return first 10k chars of extracted text
     if (request.form.get("secret") or request.headers.get("X-Secret")) != APP_SECRET:
         return jsonify({"error": "unauthorized"}), 401
     f = request.files.get("file")
     if not f:
         return jsonify({"error": "no file"}), 400
     txt = extract_text(io.BytesIO(f.read())) or ""
-    # return first 10k chars to avoid huge responses
     return jsonify({"text": txt[:10000]})
+
 
 def health():
     return jsonify({"ok": True, "message": "Elite Ticket Ingest API is running."})
